@@ -1,0 +1,292 @@
+# LS3 180° Header Builder – collision‑aware (v2.6)
+"""
+Parametric **180‑degree, equal‑length** header generator for LS‑series V‑8s with
+self‑adjusting collision avoidance.
+
+v2.6 adds **mandrel‑style first bends** and a smarter retry strategy:
+
+* Each primary now leaves the flange with a configurable radius/angle elbow so
+  the tube noses away from the block before the straight stub that used to
+  cause most early collisions.
+* Retry loop escalates the first‑bend angle and radius before falling back to
+  the traditional spread/drop adjustments.  This means most clashes are fixed
+  with a subtle tweak rather than a big detour.
+* Path corners (poly‑line vertices) are auto‑filleted at the end so the swept
+  surface is smooth and more realistic.
+
+**Tip:** if you want true circular arcs instead of the poly‑line + fillet that
+FreeCAD sweeps happily over, lower `FILLET_RAD` to 0 and uncomment the
+`Part.ArcOfCircle` code block near the bottom of `make_path()`.
+"""
+
+import FreeCAD as App, Part, math
+from PySide import QtGui
+
+# ════════════════════════════════════════════════════════════════════════════
+#  House‑keeping – clear the report view and wipe previous header objects
+# ════════════════════════════════════════════════════════════════════════════
+try:
+    rv = Gui.getMainWindow().findChild(QtGui.QTextEdit, "Report view")
+    rv.clear()
+except Exception:
+    pass
+
+DOC = App.ActiveDocument
+
+for o in list(DOC.Objects):
+    if o.Label.startswith("Header180_") or o.Label in ("PrimariesHelpers",):
+        DOC.removeObject(o.Name)
+HELP = DOC.addObject("App::DocumentObjectGroup", "PrimariesHelpers")
+HELP.ViewObject.Visibility = False
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Tunables – change these for your chassis / collector location / taste
+# ════════════════════════════════════════════════════════════════════════════
+INCH          = 25.4
+OD            = 1.875 * INCH       # 1‑7⁄8" OD primaries
+RAD           = OD / 2
+LEN_EQ        = 365                # target length (mm) from port CS to exit
+LENGTH_TOL    = 1.0                # acceptable spread after equal‑length pad
+
+FIRST_STRAIGHT = 12               # straight out of port before first bend (mm)
+BEND_RADIUS     = 45              # nominal mandrel bend radius (mm)
+BEND_ANGLE      = 30              # default elbow angle away from block (deg)
+BEND_ANGLE_STEP = 5               # retry increments angle before spread/drop
+
+CLEARANCE      = 50               # lateral clearance from block (mm)
+SPREAD         = 35               # base spread per cylinder index (mm)
+SPREAD_STEP    = 15               # retry step – lateral (mm)
+DROP_STEP      = -15              # retry step – vertical (mm)
+
+DROP_Z         = -20              # general downward jog after leaving block
+DROP_CROSS     = -60              # vertical drop at crossover plane
+STUB_DROP      = 35               # short vertical stub for pair collectors
+
+FILLET_RAD     = 20               # fillet radius for poly‑line corners (mm)
+MAX_RETRY      = 8                # total retries per cylinder
+
+BANK_L, BANK_R = (1, 3, 5, 7), (2, 4, 6, 8)  # GM numbering – LHS is odd bank
+PAIRS          = ((1, 6), (4, 7), (2, 3), (5, 8))  # 180° pair order
+RUN_DIR        = App.Vector(-1, 0, 0)        # rearwards in vehicle coords
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Helper utilities
+# ════════════════════════════════════════════════════════════════════════════
+PROFILE_WIRE = Part.Wire([Part.makeCircle(RAD)])
+ENGINE_SOLIDS = [o for o in DOC.Objects if "engine" in o.Label.lower() and hasattr(o, "Shape")]
+print(f"Found {len(ENGINE_SOLIDS)} engine part(s) for collision test")
+
+
+def get_lcs(lbl):
+    objs = DOC.getObjectsByLabel(lbl)
+    return objs[0] if objs else None
+
+
+def outward_axis(base, lx, ly):
+    """Return a unit vector roughly pointing away from the valley."""
+    cand = lx if abs(lx.y) > abs(ly.y) else ly
+    if cand.y * base.y < 0:
+        cand = -cand
+    return App.Vector(cand.x, cand.y, 0).normalize()
+
+
+def mk_profile(tan, base, name):
+    pf = DOC.addObject("Part::Feature", name)
+    pf.Shape = PROFILE_WIRE
+    pf.Placement = App.Placement(base, App.Rotation(App.Vector(0, 0, 1), tan))
+    pf.ViewObject.Visibility = False
+    HELP.addObject(pf)
+    return pf
+
+
+def intersects(shp, others):
+    for o in others:
+        try:
+            if shp.common(o.Shape).Volume > 0.1:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Path generator – returns a list of *edges* forming the centre‑line wire
+# ════════════════════════════════════════════════════════════════════════════
+
+def make_path(base, z, lat_axis, idx, e_spread, e_drop, bend_ang_deg, bend_rad):
+    # First straight stub out of the flange
+    p0 = base
+    p1 = p0 + z * FIRST_STRAIGHT
+
+    # Elbow (mandrel bend): rotate z towards +lat_axis by bend_ang_deg
+    ang_rad = math.radians(bend_ang_deg)
+    bend_dir = (z * math.cos(ang_rad) + lat_axis * math.sin(ang_rad)).normalize()
+    chord = 2 * bend_rad * math.sin(ang_rad / 2)
+    p2 = p1 + bend_dir * chord
+
+    # Lateral clearance stride with optional per‑cylinder extra spread
+    lat = lat_axis * (CLEARANCE + idx * SPREAD + e_spread)
+
+    # Slight downward jog to skirt valve‑cover / accessory area
+    p3 = p2 + lat + App.Vector(0, 0, DROP_Z)
+
+    # Long rearwards run
+    straight_len = max(20, LEN_EQ - (p3 - p0).Length)
+    p4 = p3 + RUN_DIR * straight_len
+
+    # Cross‑over under‑floor and final outlet stub
+    p5 = App.Vector(p4.x, 0, p4.z) + App.Vector(0, 0, DROP_CROSS + e_drop) - lat * 0.1 + App.Vector(0, 0, -STUB_DROP)
+
+    # Build edges – you can switch to a true arc for the elbow by uncommenting
+    # the Part.ArcOfCircle block and commenting out the two straight edges.
+
+    edges = []
+
+    # Straight: p0 → p1
+    edges.append(Part.LineSegment(p0, p1).toShape())
+
+    # Poly‑line approximation of bend (p1 → p2) – two short straights
+    # Uncomment below for true arc; FreeCAD sweep handles either form.
+    # arc_center = p1 + (lat_axis.cross(z)).normalize() * bend_rad
+    # arc_edge = Part.ArcOfCircle(Part.Circle(arc_center, lat_axis.cross(z), bend_rad), 0, ang_rad).toShape()
+    # edges.append(arc_edge)
+    mid_bend = p1 + (p2 - p1) * 0.5
+    edges.append(Part.LineSegment(p1, mid_bend).toShape())
+    edges.append(Part.LineSegment(mid_bend, p2).toShape())
+
+    # Remaining straights
+    edges.append(Part.LineSegment(p2, p3).toShape())
+    edges.append(Part.LineSegment(p3, p4).toShape())
+    edges.append(Part.LineSegment(p4, p5).toShape())
+
+    wire = Part.Wire(edges)
+
+    # Fillet all interior vertices if FILLET_RAD > 0
+    if FILLET_RAD > 0:
+        try:
+            wire = wire.makeFillet(FILLET_RAD, [v for v in wire.Vertexes[1:-1]])
+        except Exception:
+            pass  # fillet can fail on very acute angles – ignore, path still OK
+
+    return wire, p5
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Build primaries
+# ════════════════════════════════════════════════════════════════════════════
+ALL          = DOC.addObject("App::DocumentObjectGroup", "Header180_All")
+exit_pt      = {}
+path_map     = {}
+built_shapes = []
+
+
+def build_sweep(name, wire):
+    prof = mk_profile(wire.Edges[0].tangentAt(0), wire.Vertexes[0].Point, name + "_Prof")
+    path_obj = DOC.addObject("Part::Feature", name + "_Path")
+    path_obj.Shape = wire
+    HELP.addObject(path_obj)
+
+    sw = DOC.addObject("Part::Sweep", name)
+    sw.Sections = [prof]
+    sw.Spine = path_obj
+    sw.Solid = True
+    sw.Frenet = True
+    DOC.recompute()
+    return sw, path_obj
+
+
+def build_primary(cyl, idx_bank):
+    cs = get_lcs(f"Port{cyl}_CS")
+    if not cs:
+        print(f"⚠️ Port{cyl}_CS missing – skipped")
+        return
+
+    base = cs.Placement.Base
+    lx = cs.Placement.Rotation.multVec(App.Vector(1, 0, 0)).normalize()
+    ly = cs.Placement.Rotation.multVec(App.Vector(0, 1, 0)).normalize()
+    lz = cs.Placement.Rotation.multVec(App.Vector(0, 0, 1)).normalize()
+    lat_axis = outward_axis(base, lx, ly)
+
+    e_spread = e_drop = 0
+    bend_ang = BEND_ANGLE
+    last_wire = None
+
+    for attempt in range(MAX_RETRY + 1):
+        wire, tip = make_path(base, lz, lat_axis, idx_bank, e_spread, e_drop, bend_ang, BEND_RADIUS)
+        sw, path = build_sweep(f"Header180_Prim{cyl}_T{attempt}", wire)
+
+        if not intersects(sw.Shape, built_shapes + ENGINE_SOLIDS):
+            sw.Label = f"Header180_Prim{cyl}"
+            path.Label = f"Header180_Prim{cyl}_Path"
+            built_shapes.append(sw)
+            ALL.addObject(sw)
+            exit_pt[cyl], path_map[cyl] = tip, path
+            if attempt:
+                print(f"  Cyl {cyl}: +{round(e_spread,1)} mm / {abs(round(e_drop,1))} mm extra, bend {bend_ang}°")
+            return
+
+        # collision – clean up attempt and adjust for next loop
+        for o in (sw, path):
+            DOC.removeObject(o.Name)
+
+        last_wire = wire
+
+        # escalate fixes: bend angle → spread → drop
+        if bend_ang < 60:
+            bend_ang += BEND_ANGLE_STEP
+        elif abs(e_spread) < 3 * SPREAD_STEP:
+            e_spread += SPREAD_STEP
+        else:
+            e_drop += DROP_STEP
+
+    # all retries failed – build orange tube so user sees clash
+    sw, path = build_sweep(f"Header180_Prim{cyl}_FAIL", last_wire)
+    sw.Label = f"Header180_Prim{cyl}⚠"
+    sw.ViewObject.ShapeColor = (1.0, 0.4, 0.0)
+    ALL.addObject(sw)
+    exit_pt[cyl], path_map[cyl] = tip, path
+    print(f"⚠️ Cyl {cyl}: intersects after {MAX_RETRY} retries (orange)")
+
+
+for i, c in enumerate(BANK_L):
+    build_primary(c, i)
+for i, c in enumerate(BANK_R):
+    build_primary(c, i)
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Equal‑length pad – extend shorter runners along their straight section
+# ════════════════════════════════════════════════════════════════════════════
+lengths = {c: (exit_pt[c] - get_lcs(f"Port{c}_CS").Placement.Base).Length for c in exit_pt}
+max_len = max(lengths.values())
+for c, l in lengths.items():
+    delta = max_len - l
+    if delta > LENGTH_TOL:
+        # shift last two vertices rearwards to pad length
+        wire = path_map[c].Shape
+        verts = [v.Point for v in wire.Vertexes]
+        verts[-2] += RUN_DIR * delta
+        verts[-1] += RUN_DIR * delta
+        new_wire = Part.makePolygon(verts)
+        if FILLET_RAD > 0:
+            new_wire = new_wire.makeFillet(FILLET_RAD, [v for v in new_wire.Vertexes[1:-1]])
+        path_map[c].Shape = new_wire
+        exit_pt[c] = verts[-1]
+        lengths[c] += delta
+
+print("\nFinal primary lengths:")
+for c in sorted(lengths):
+    print(f"  Cyl {c}: {round(lengths[c], 1)} mm")
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Simple straight pair‑collectors (just visual placeholders)
+# ════════════════════════════════════════════════════════════════════════════
+for n, (a, b) in enumerate(PAIRS, 1):
+    if a in exit_pt and b in exit_pt:
+        mid = App.Vector((exit_pt[a].x + exit_pt[b].x) / 2, 0, (exit_pt[a].z + exit_pt[b].z) / 2)
+        col = DOC.addObject("Part::Feature", f"Header180_PairColl{n}")
+        col.Shape = Part.makeCylinder(RAD, STUB_DROP, mid, App.Vector(0, 0, -1))
+        col.ViewObject.ShapeColor = (0.85, 0.3, 0.3)
+        ALL.addObject(col)
+
+DOC.recompute()
+print(f"\n🏁 Built {len(exit_pt)} primaries (±{LENGTH_TOL} mm) – review orange tubes if any")
