@@ -63,6 +63,8 @@ DROP_STEP      = -15              # retry step – vertical (mm)
 DROP_Z         = -20              # general downward jog after leaving block
 DROP_CROSS     = -60              # vertical drop at crossover plane
 STUB_DROP      = 35               # short vertical stub for pair collectors
+COLLECTOR_OFFSET = 25             # lateral offset for each pair collector (mm)
+MIN_CLEARANCE_Z = -100            # lowest allowed Z after padding (mm)
 
 FILLET_RAD     = 20               # fillet radius for poly‑line corners (mm)
 MAX_RETRY      = 8                # total retries per cylinder
@@ -280,11 +282,15 @@ max_len = max(lengths.values())
 for c, l in lengths.items():
     delta = max_len - l
     if delta > LENGTH_TOL:
-        # shift last two vertices rearwards to pad length
+        # extend last segment along its current direction
         wire = path_map[c].Shape
         verts = [v.Point for v in wire.Vertexes]
-        verts[-2] += RUN_DIR * delta
-        verts[-1] += RUN_DIR * delta
+        direction = (verts[-1] - verts[-2]).normalize()
+        delta_vec = direction * delta
+        if verts[-1].z + delta_vec.z < MIN_CLEARANCE_Z:
+            delta_vec.z = MIN_CLEARANCE_Z - verts[-1].z
+        verts[-2] += delta_vec
+        verts[-1] += delta_vec
         new_wire = Part.makePolygon(verts)
         if FILLET_RAD > 0 and hasattr(new_wire, "Vertexes") and len(new_wire.Vertexes) > 2:
             try:
@@ -304,7 +310,9 @@ for c in sorted(lengths):
 # ════════════════════════════════════════════════════════════════════════════
 for n, (a, b) in enumerate(PAIRS, 1):
     if a in exit_pt and b in exit_pt:
-        mid = App.Vector((exit_pt[a].x + exit_pt[b].x) / 2, 0, (exit_pt[a].z + exit_pt[b].z) / 2)
+        off_y = COLLECTOR_OFFSET * (-1)**n
+        mid = App.Vector((exit_pt[a].x + exit_pt[b].x) / 2, off_y,
+                         (exit_pt[a].z + exit_pt[b].z) / 2)
 
         wire_a = Part.Wire([Part.LineSegment(exit_pt[a], mid).toShape()])
         wire_b = Part.Wire([Part.LineSegment(exit_pt[b], mid).toShape()])
@@ -312,7 +320,21 @@ for n, (a, b) in enumerate(PAIRS, 1):
         sb, _ = build_sweep(f"Header180_Pair{n}_B", wire_b)
         for s in (sa, sb):
             s.ViewObject.ShapeColor = (0.85, 0.3, 0.3)
+            built_shapes.append(s)
             ALL.addObject(s)
 
 DOC.recompute()
+
+# Final collision sweep after padding and collectors
+for sw in built_shapes:
+    others = [o for o in built_shapes if o != sw] + ENGINE_SOLIDS
+    collider, contact = intersects(sw.Shape, others)
+    if collider:
+        print(f"  {sw.Label} collides with {collider.Label} after post processing")
+        if contact:
+            dbg = DOC.addObject("Part::Feature", f"Coll_final_{sw.Label}")
+            dbg.Shape = contact
+            dbg.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+            COLL.addObject(dbg)
+
 print(f"\n🏁 Built {len(exit_pt)} primaries (±{LENGTH_TOL} mm) – review orange tubes if any")

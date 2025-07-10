@@ -8,6 +8,7 @@ Based on the current `Primaries.FCMacro` script and the desired 8‑4‑2‑turb
 - [x] Expose collided geometry so we can inspect where the tube hits the engine.
 - [x] Improve the `intersects()` helper to return which object caused the clash
       and where it happened.
+- [x] Re-test for collisions after equal-length padding and collector creation.
 - [ ] Allow automatic path adjustments beyond the current angle/spread/drop
       strategy (e.g. incremental twist or additional control points).
 - [ ] Avoid orange failures by trying shorter steps before giving up.
@@ -21,6 +22,9 @@ Based on the current `Primaries.FCMacro` script and the desired 8‑4‑2‑turb
       then route to the collector position.
 - [x] Join paired primaries together into a Y‑pipe (currently only a straight
       placeholder cylinder is created).
+- [x] Offset pair collectors laterally so they don't overlap.
+- [x] Extend length padding along the final segment direction to maintain
+      clearance.
 - [ ] Parametrise collector position and orientation so that 4‑2 merge pieces can
       be generated automatically.
 
