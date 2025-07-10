@@ -11,6 +11,8 @@ Based on the current `Primaries.FCMacro` script and the desired 8‑4‑2‑turb
 - [ ] Allow automatic path adjustments beyond the current angle/spread/drop
       strategy (e.g. incremental twist or additional control points).
 - [ ] Avoid orange failures by trying shorter steps before giving up.
+- [ ] Improve engine part detection so collisions work even if parts aren't
+      labelled with "engine". Allow specifying a custom group or pattern.
 
 ## Path generation
 

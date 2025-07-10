@@ -286,8 +286,11 @@ for c, l in lengths.items():
         verts[-2] += RUN_DIR * delta
         verts[-1] += RUN_DIR * delta
         new_wire = Part.makePolygon(verts)
-        if FILLET_RAD > 0:
-            new_wire = new_wire.makeFillet(FILLET_RAD, [v for v in new_wire.Vertexes[1:-1]])
+        if FILLET_RAD > 0 and hasattr(new_wire, "Vertexes") and len(new_wire.Vertexes) > 2:
+            try:
+                new_wire = new_wire.makeFillet(FILLET_RAD, [v for v in new_wire.Vertexes[1:-1]])
+            except Exception:
+                pass
         path_map[c].Shape = new_wire
         exit_pt[c] = verts[-1]
         lengths[c] += delta
