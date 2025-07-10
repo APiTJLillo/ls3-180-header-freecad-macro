@@ -38,6 +38,8 @@ for o in list(DOC.Objects):
         DOC.removeObject(o.Name)
 HELP = DOC.addObject("App::DocumentObjectGroup", "PrimariesHelpers")
 HELP.ViewObject.Visibility = False
+COLL = DOC.addObject("App::DocumentObjectGroup", "Header180_Collisions")
+COLL.ViewObject.Visibility = False
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Tunables – change these for your chassis / collector location / taste
@@ -61,6 +63,8 @@ DROP_STEP      = -15              # retry step – vertical (mm)
 DROP_Z         = -20              # general downward jog after leaving block
 DROP_CROSS     = -60              # vertical drop at crossover plane
 STUB_DROP      = 35               # short vertical stub for pair collectors
+COLLECTOR_OFFSET = 25             # lateral offset for each pair collector (mm)
+MIN_Z_CLEAR    = -100             # lowest allowed Z after padding (mm)
 
 FILLET_RAD     = 20               # fillet radius for poly‑line corners (mm)
 MAX_RETRY      = 8                # total retries per cylinder
@@ -100,13 +104,15 @@ def mk_profile(tan, base, name):
 
 
 def intersects(shp, others):
+    """Return (object, shape) if *shp* intersects one of *others*."""
     for o in others:
         try:
-            if shp.common(o.Shape).Volume > 0.1:
-                return True
+            inter = shp.common(o.Shape)
+            if inter.Volume > 0.1:
+                return o, inter
         except Exception:
             pass
-    return False
+    return None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -130,12 +136,16 @@ def make_path(base, z, lat_axis, idx, e_spread, e_drop, bend_ang_deg, bend_rad):
     # Slight downward jog to skirt valve‑cover / accessory area
     p3 = p2 + lat + App.Vector(0, 0, DROP_Z)
 
-    # Long rearwards run
+    # Long rearwards run split into pre and post crossover
     straight_len = max(20, LEN_EQ - (p3 - p0).Length)
-    p4 = p3 + RUN_DIR * straight_len
+    pre_len = straight_len * 0.6
+    post_len = straight_len - pre_len
+    p4 = p3 + RUN_DIR * pre_len
 
-    # Cross‑over under‑floor and final outlet stub
-    p5 = App.Vector(p4.x, 0, p4.z) + App.Vector(0, 0, DROP_CROSS + e_drop) - lat * 0.1 + App.Vector(0, 0, -STUB_DROP)
+    # Crossover path under the engine
+    p5 = p4 + App.Vector(0, 0, DROP_CROSS / 2 + e_drop)
+    p6 = App.Vector(p5.x, 0, p5.z + DROP_CROSS / 2)
+    p7 = p6 + RUN_DIR * post_len - lat * 0.1 + App.Vector(0, 0, -STUB_DROP)
 
     # Build edges – you can switch to a true arc for the elbow by uncommenting
     # the Part.ArcOfCircle block and commenting out the two straight edges.
@@ -158,6 +168,8 @@ def make_path(base, z, lat_axis, idx, e_spread, e_drop, bend_ang_deg, bend_rad):
     edges.append(Part.LineSegment(p2, p3).toShape())
     edges.append(Part.LineSegment(p3, p4).toShape())
     edges.append(Part.LineSegment(p4, p5).toShape())
+    edges.append(Part.LineSegment(p5, p6).toShape())
+    edges.append(Part.LineSegment(p6, p7).toShape())
 
     wire = Part.Wire(edges)
 
@@ -168,7 +180,7 @@ def make_path(base, z, lat_axis, idx, e_spread, e_drop, bend_ang_deg, bend_rad):
         except Exception:
             pass  # fillet can fail on very acute angles – ignore, path still OK
 
-    return wire, p5
+    return wire, p7
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -178,6 +190,8 @@ ALL          = DOC.addObject("App::DocumentObjectGroup", "Header180_All")
 exit_pt      = {}
 path_map     = {}
 built_shapes = []
+sweep_map   = {}
+param_map   = {}
 
 
 def build_sweep(name, wire):
@@ -215,17 +229,29 @@ def build_primary(cyl, idx_bank):
         wire, tip = make_path(base, lz, lat_axis, idx_bank, e_spread, e_drop, bend_ang, BEND_RADIUS)
         sw, path = build_sweep(f"Header180_Prim{cyl}_T{attempt}", wire)
 
-        if not intersects(sw.Shape, built_shapes + ENGINE_SOLIDS):
+        collider, contact = intersects(sw.Shape, built_shapes + ENGINE_SOLIDS)
+        if collider is None:
             sw.Label = f"Header180_Prim{cyl}"
             path.Label = f"Header180_Prim{cyl}_Path"
             built_shapes.append(sw)
+            sweep_map[cyl] = sw
             ALL.addObject(sw)
             exit_pt[cyl], path_map[cyl] = tip, path
+            param_map[cyl] = (base, lz, lat_axis, idx_bank,
+                              e_spread, e_drop, bend_ang, BEND_RADIUS)
             if attempt:
                 print(f"  Cyl {cyl}: +{round(e_spread,1)} mm / {abs(round(e_drop,1))} mm extra, bend {bend_ang}°")
             return
 
-        # collision – clean up attempt and adjust for next loop
+        # collision – show contact and adjust for next loop
+        if contact:
+            dbg = DOC.addObject("Part::Feature", f"Coll_{cyl}_{attempt}")
+            dbg.Shape = contact
+            dbg.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+            COLL.addObject(dbg)
+        if collider:
+            print(f"  Cyl {cyl}: clash with {collider.Label} on try {attempt}")
+
         for o in (sw, path):
             DOC.removeObject(o.Name)
 
@@ -244,13 +270,16 @@ def build_primary(cyl, idx_bank):
     sw.Label = f"Header180_Prim{cyl}⚠"
     sw.ViewObject.ShapeColor = (1.0, 0.4, 0.0)
     ALL.addObject(sw)
+    built_shapes.append(sw)
+    sweep_map[cyl] = sw
     exit_pt[cyl], path_map[cyl] = tip, path
+    param_map[cyl] = (base, lz, lat_axis, idx_bank, e_spread, e_drop, bend_ang, BEND_RADIUS)
     print(f"⚠️ Cyl {cyl}: intersects after {MAX_RETRY} retries (orange)")
 
 
-for i, c in enumerate(BANK_L):
+for i, c in reversed(list(enumerate(BANK_L))):
     build_primary(c, i)
-for i, c in enumerate(BANK_R):
+for i, c in reversed(list(enumerate(BANK_R))):
     build_primary(c, i)
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -261,14 +290,21 @@ max_len = max(lengths.values())
 for c, l in lengths.items():
     delta = max_len - l
     if delta > LENGTH_TOL:
-        # shift last two vertices rearwards to pad length
+        # extend last segment along its current direction
         wire = path_map[c].Shape
         verts = [v.Point for v in wire.Vertexes]
-        verts[-2] += RUN_DIR * delta
-        verts[-1] += RUN_DIR * delta
+        direction = (verts[-1] - verts[-2]).normalize()
+        delta_vec = direction * delta
+        if verts[-1].z + delta_vec.z < MIN_Z_CLEAR:
+            delta_vec.z = MIN_Z_CLEAR - verts[-1].z
+        verts[-2] += delta_vec
+        verts[-1] += delta_vec
         new_wire = Part.makePolygon(verts)
-        if FILLET_RAD > 0:
-            new_wire = new_wire.makeFillet(FILLET_RAD, [v for v in new_wire.Vertexes[1:-1]])
+        if FILLET_RAD > 0 and hasattr(new_wire, "Vertexes") and len(new_wire.Vertexes) > 2:
+            try:
+                new_wire = new_wire.makeFillet(FILLET_RAD, [v for v in new_wire.Vertexes[1:-1]])
+            except Exception:
+                pass
         path_map[c].Shape = new_wire
         exit_pt[c] = verts[-1]
         lengths[c] += delta
@@ -277,16 +313,75 @@ print("\nFinal primary lengths:")
 for c in sorted(lengths):
     print(f"  Cyl {c}: {round(lengths[c], 1)} mm")
 
+# Re-check collisions after padding
+for c, sw in sweep_map.items():
+    collider, _ = intersects(sw.Shape, ENGINE_SOLIDS)
+    if collider:
+        print(f"  Cyl {c}: post-pad clash with {collider.Label}; dropping further")
+        base, lz, lat_axis, idx_bank, e_spread, e_drop, bend_ang, rad = param_map[c]
+        e_drop += DROP_STEP
+        wire, tip = make_path(base, lz, lat_axis, idx_bank, e_spread, e_drop,
+                              bend_ang, rad)
+        path_map[c].Shape = wire
+        exit_pt[c] = tip
+        param_map[c] = (base, lz, lat_axis, idx_bank, e_spread, e_drop,
+                        bend_ang, rad)
+        DOC.recompute()
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Simple straight pair‑collectors (just visual placeholders)
 # ════════════════════════════════════════════════════════════════════════════
 for n, (a, b) in enumerate(PAIRS, 1):
     if a in exit_pt and b in exit_pt:
-        mid = App.Vector((exit_pt[a].x + exit_pt[b].x) / 2, 0, (exit_pt[a].z + exit_pt[b].z) / 2)
-        col = DOC.addObject("Part::Feature", f"Header180_PairColl{n}")
-        col.Shape = Part.makeCylinder(RAD, STUB_DROP, mid, App.Vector(0, 0, -1))
-        col.ViewObject.ShapeColor = (0.85, 0.3, 0.3)
-        ALL.addObject(col)
+        off_y = COLLECTOR_OFFSET * (-1)**n
+        mid = App.Vector((exit_pt[a].x + exit_pt[b].x) / 2, off_y,
+                         (exit_pt[a].z + exit_pt[b].z) / 2)
+
+        wire_a = Part.Wire([Part.LineSegment(exit_pt[a], mid).toShape()])
+        wire_b = Part.Wire([Part.LineSegment(exit_pt[b], mid).toShape()])
+
+        sa, _ = build_sweep(f"Header180_Pair{n}_A", wire_a)
+        collider, contact = intersects(sa.Shape, built_shapes + ENGINE_SOLIDS)
+        if collider is None:
+            sa.ViewObject.ShapeColor = (0.85, 0.3, 0.3)
+            built_shapes.append(sa)
+            ALL.addObject(sa)
+        else:
+            if contact:
+                dbg = DOC.addObject("Part::Feature", f"Coll_Pair{n}_A")
+                dbg.Shape = contact
+                dbg.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+                COLL.addObject(dbg)
+            print(f"  Pair {n} stub A clashes with {collider.Label}")
+            DOC.removeObject(sa.Name)
+
+        sb, _ = build_sweep(f"Header180_Pair{n}_B", wire_b)
+        collider, contact = intersects(sb.Shape, built_shapes + ENGINE_SOLIDS)
+        if collider is None:
+            sb.ViewObject.ShapeColor = (0.85, 0.3, 0.3)
+            built_shapes.append(sb)
+            ALL.addObject(sb)
+        else:
+            if contact:
+                dbg = DOC.addObject("Part::Feature", f"Coll_Pair{n}_B")
+                dbg.Shape = contact
+                dbg.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+                COLL.addObject(dbg)
+            print(f"  Pair {n} stub B clashes with {collider.Label}")
+            DOC.removeObject(sb.Name)
 
 DOC.recompute()
+
+# Final collision sweep after padding and collectors
+for sw in built_shapes:
+    others = [o for o in built_shapes if o != sw] + ENGINE_SOLIDS
+    collider, contact = intersects(sw.Shape, others)
+    if collider:
+        print(f"  {sw.Label} collides with {collider.Label} after post processing")
+        if contact:
+            dbg = DOC.addObject("Part::Feature", f"Coll_final_{sw.Label}")
+            dbg.Shape = contact
+            dbg.ViewObject.ShapeColor = (1.0, 0.0, 0.0)
+            COLL.addObject(dbg)
+
 print(f"\n🏁 Built {len(exit_pt)} primaries (±{LENGTH_TOL} mm) – review orange tubes if any")
